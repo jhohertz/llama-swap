@@ -1,0 +1,58 @@
+# Shared model cache for test backends.
+#
+# Storage class: on maximus use `longhorn` (distributed, ReadWriteMany,
+# Immediate binding, node-portable). k3s' default `local-path` is node-local
+# (WaitForFirstConsumer) and would pin every backend pod to one node.
+#
+# 5 GiB covers the test models with room to spare:
+#   LFM2.5-230M-Q4_0.gguf          149 MB
+#   gemma-3-270m-it-Q4_K_M.gguf    253 MB
+#   Qwen3-0.6B q4 (optional)       ~400 MB
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llama-swap-models
+  namespace: llama-swap
+spec:
+  accessModes:
+    - ReadWriteMany # shared read-only by backends; writable by the downloader
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 5Gi
+---
+# One-off downloader (delete after use). Populates the model cache from HF.
+# Verified on maximus (phase-1 spike). Notes from the spike:
+# - curlimages/curl runs as a non-root user; the longhorn volume is owned by
+#   root 0755, so the pod needs securityContext.runAsUser: 0.
+# - k3s default `local-path` volumes also refuse non-root writes.
+# kubectl apply -f - (then: kubectl -n llama-swap wait --for=condition=Ready
+# pod/model-loader --timeout=600s && kubectl -n llama-swap delete pod model-loader)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: model-loader
+  namespace: llama-swap
+spec:
+  restartPolicy: Never
+  containers:
+    - name: dl
+      image: curlimages/curl:8.10.1
+      securityContext:
+        runAsUser: 0
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          curl -L --fail -o /models/LFM2.5-230M-Q4_0.gguf \
+            https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_0.gguf
+          curl -L --fail -o /models/gemma-3-270m-it-Q4_K_M.gguf \
+            https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q4_K_M.gguf
+      volumeMounts:
+        - name: models
+          mountPath: /models
+  volumes:
+    - name: models
+      persistentVolumeClaim:
+        claimName: llama-swap-models

@@ -1,0 +1,47 @@
+# ServiceAccount + namespaced RBAC for the llama-swap head-end.
+# Scope: the managed namespace only. No cluster-scoped permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llama-swap
+  namespace: llama-swap
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llama-swap
+  namespace: llama-swap
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get] # -> logmon, so /logs/stream/{model} works
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [get, list] # debuggability of provisioning failures
+# Phase 3 adds: patch on deployments (scale-up).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llama-swap
+  namespace: llama-swap
+subjects:
+  - kind: ServiceAccount
+    name: llama-swap
+    namespace: llama-swap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llama-swap

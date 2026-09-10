@@ -1,0 +1,142 @@
+# Dev head-end for local testing against maximus.
+# Single replica by design (see PLAN.md phase 5 for HA).
+#
+#   kubectl apply -f rbac.yaml -f model-cache-pvc.yaml -f head-end.yaml
+#   (populating the model cache: see model-cache-pvc.yaml)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama-swap-config
+  namespace: llama-swap
+data:
+  config.yaml: |
+    # kubernetes models are just `cmd`/`cmdStop` pointing at the kubeswap
+    # wrapper (see ../../cmd/kubeswap/README.md) — no special backend keyword.
+    global:
+      maxConcurrentModels: 2
+
+    routing:
+      router:
+        use: group
+      group:
+        - models:
+            - lfm25-230m
+        - models:
+            - gemma3-270m
+
+    models:
+      lfm25-230m:
+        cmd: >-
+          kubeswap serve
+          --listen 127.0.0.1:${PORT}
+          --model lfm25-230m
+          --namespace llama-swap
+          --image ghcr.io/ggml-org/llama.cpp:server-vulkan
+          --gpu amd.com/gpu=1
+          --node-selector feature.node.kubernetes.io/amd-gpu=true
+          --volume pvc:llama-swap-models:/models:ro
+          --volume emptydir:slots:/slots
+          --
+          --model /models/LFM2.5-230M-Q4_0.gguf
+          --port 8080
+          -ngl 99
+          -np 2
+          --cache-ram 8
+          --slot-save-path /slots
+        cmdStop: kubeswap delete --model lfm25-230m --namespace llama-swap
+        healthCheckTimeout: 120s
+        ttl: 30m
+      gemma3-270m:
+        cmd: >-
+          kubeswap serve
+          --listen 127.0.0.1:${PORT}
+          --model gemma3-270m
+          --namespace llama-swap
+          --image ghcr.io/ggml-org/llama.cpp:server-vulkan
+          --gpu amd.com/gpu=1
+          --node-selector feature.node.kubernetes.io/amd-gpu=true
+          --volume pvc:llama-swap-models:/models:ro
+          --volume emptydir:slots:/slots
+          --
+          --model /models/gemma-3-270m-it-Q4_K_M.gguf
+          --port 8080
+          -ngl 99
+          -np 2
+          --cache-ram 8
+          --slot-save-path /slots
+        cmdStop: kubeswap delete --model gemma3-270m --namespace llama-swap
+        healthCheckTimeout: 120s
+        ttl: 30m
+        # CPU fallback: drop --gpu/--node-selector from either cmd above.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-swap
+  namespace: llama-swap
+  labels:
+    app: llama-swap
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # never two head-ends at once (state duplication)
+  selector:
+    matchLabels:
+      app: llama-swap
+  template:
+    metadata:
+      labels:
+        app: llama-swap
+    spec:
+      serviceAccountName: llama-swap
+      initContainers:
+        # One-shot gc per head-end start: removes workloads whose models are
+        # no longer in the config (leftovers from removed/renamed models).
+        - name: kubeswap-gc
+          image: ghcr.io/mostlygeek/llama-swap:unified-vulkan
+          command: ["/usr/local/bin/kubeswap", "gc", "--namespace",
+                    "llama-swap", "--config", "/config/config.yaml"]
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      containers:
+        - name: llama-swap
+          # Vulkan build (user preference: least dependencies). The head-end
+          # itself needs no GPU; the inference servers in the image are unused.
+          image: ghcr.io/mostlygeek/llama-swap:unified-vulkan
+          args:
+            - -port
+            - "8080"
+            - -config
+            - /config/config.yaml
+            - -watch-config
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: llama-swap-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-swap
+  namespace: llama-swap
+spec:
+  type: ClusterIP
+  selector:
+    app: llama-swap
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

@@ -12,17 +12,23 @@ data:
   config.yaml: |
     # kubernetes models are just `cmd`/`cmdStop` pointing at the kubeswap
     # wrapper (see ../../cmd/kubeswap/README.md) — no special backend keyword.
-    global:
-      maxConcurrentModels: 2
+    healthCheckTimeout: 300 # seconds for the backend pod to become ready
+    unloadTimeout: 60       # seconds to wait for cmdStop (pod termination)
 
     routing:
       router:
         use: group
-      group:
-        - models:
-            - lfm25-230m
-        - models:
-            - gemma3-270m
+        settings:
+          groups:
+            # Exclusive swap groups: one model at a time (single GPU).
+            lfm25:
+              swap: true
+              exclusive: true
+              members: [lfm25-230m]
+            gemma3:
+              swap: true
+              exclusive: true
+              members: [gemma3-270m]
 
     models:
       lfm25-230m:
@@ -43,9 +49,8 @@ data:
           -np 2
           --cache-ram 8
           --slot-save-path /slots
-        cmdStop: kubeswap delete --model lfm25-230m --namespace llama-swap
-        healthCheckTimeout: 120s
-        ttl: 30m
+        cmdStop: kubeswap delete --model lfm25-230m --namespace llama-swap --wait 60s
+        ttl: 1800
       gemma3-270m:
         cmd: >-
           kubeswap serve
@@ -64,9 +69,8 @@ data:
           -np 2
           --cache-ram 8
           --slot-save-path /slots
-        cmdStop: kubeswap delete --model gemma3-270m --namespace llama-swap
-        healthCheckTimeout: 120s
-        ttl: 30m
+        cmdStop: kubeswap delete --model gemma3-270m --namespace llama-swap --wait 60s
+        ttl: 1800
         # CPU fallback: drop --gpu/--node-selector from either cmd above.
 ---
 apiVersion: apps/v1
@@ -104,10 +108,11 @@ spec:
         - name: llama-swap
           # Vulkan build (user preference: least dependencies). The head-end
           # itself needs no GPU; the inference servers in the image are unused.
+          # NOTE: needs a release that ships /usr/local/bin/kubeswap; until
+          # then test with bignas.lan:5000/testing/llama-swap-head:dev.
           image: ghcr.io/mostlygeek/llama-swap:unified-vulkan
+          command: ["/usr/local/bin/llama-swap"]
           args:
-            - -port
-            - "8080"
             - -config
             - /config/config.yaml
             - -watch-config

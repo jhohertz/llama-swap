@@ -236,10 +236,33 @@ Spike results (all pass):
 
 Still open for phase 1 hardening:
 
-- End-to-end run with llama-swap itself driving `cmd`/`cmdStop` in-cluster
-  (the in-cluster head-end + initContainer gc from `head-end.yaml`) — the
-  host-side flow above covers the same wrapper paths.
+- ~~End-to-end run with llama-swap itself driving `cmd`/`cmdStop`
+  in-cluster~~ — done (see below).
+- `matrix` router and the pure-CPU path exercise the same `cmd`/`cmdStop`
+  machinery (group router verified live; CPU rendering is unit-tested —
+  no `resources` block, no node selector).
 - `-np` slot/session management (phase 2), sticky routing (phase 3).
+
+In-cluster e2e (head-end as a pod, test image
+`bignas.lan:5000/testing/llama-swap-head:dev` = llama-swap with embedded UI
++ kubeswap on distroless/static; the manifest's `ghcr.io/mostlygeek/llama-swap:unified-vulkan`
+reference becomes correct once a release ships `kubeswap`): all pass.
+
+1. `POST /v1/chat/completions` for unloaded `lfm25-230m` → llama-swap
+   launched `kubeswap serve`, health check passed on the wrapper port
+   (`http://localhost:5801/health`), completion streamed.
+2. Request for `gemma3-270m` (exclusive group) evicted `lfm25-230m` via
+   `cmdStop` (Deployment deleted, pod gone) and served gemma3.
+3. Clean head-end pod deletion: llama-swap ran `cmdStop` on shutdown — no
+   orphans; the fresh pod's `kubeswap-gc` initContainer collected `[]`.
+4. Force-killed head-end pod (SIGKILL) with gemma3 running: the backend was
+   left orphaned; the new pod's gc **kept** it (model still configured), and
+   the new `kubeswap serve` **adopted** the live Deployment — a completion
+   returned in 0.3 s against the same backend pod (no recreate, no model
+   reload, no second GPU allocation).
+5. `POST /api/models/unload/gemma3-270m` → 200, Deployment/pod deleted.
+6. In-cluster RBAC exercised throughout (kubeswap used the head-end pod's
+   ServiceAccount token for every API call).
 
 ## 5. Phases
 

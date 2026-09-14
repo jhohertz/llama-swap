@@ -669,6 +669,17 @@ routing:
         #        a request); equal idle times fall back to definition order
         # eviction_tiebreaker: lru
 
+        # reclaim: the eviction objective:
+        # - minimal (default): minimise total eviction cost - the solver
+        #   evicts exactly what the budget forces
+        # - queue: while requests are pending, models the pending queue
+        #   does not reference are reclaimed too, so the fleet converges
+        #   on the work that is coming and queued models can load in
+        #   parallel; with an empty queue this behaves as minimal. A
+        #   model's evict_cost still protects it while the queue
+        #   references it.
+        # reclaim: queue
+
         # sets: named combinations of models that may run together.
         # Each value is an expression built from these operators:
         #   &     AND   (models run together)

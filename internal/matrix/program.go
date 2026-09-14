@@ -25,20 +25,24 @@ const (
 	TieBreakerLRU = "lru"
 )
 
-// Reclaim policies for the eviction objective. ReclaimMinimal (the default)
-// minimises the total eviction cost of the running models dropped by the
-// chosen set. ReclaimQueue, used while the scheduler has a pending queue of
-// requests, charges eviction cost only for models the queue references and
-// reclaims every running model the queue does not need, so the fleet
-// converges on the work that is coming.
+// Reclaim policies for the eviction objective. Both keep the evict list at
+// the minimal count — the models the chosen (always maximal, budget-sized)
+// set drops — so the fleet stays full and each queued connection meets
+// exactly one idle model. ReclaimMinimal (the default) orders candidates by
+// raw eviction cost. ReclaimQueue, used while the scheduler has a pending
+// queue of requests, charges eviction cost only for models the queue
+// references, so idle unqueued models turn over first and a model still in
+// the queue is protected: the queue drains one-for-one instead of churning
+// work that is about to run.
 const (
 	// ReclaimMinimal is the historical objective: minimise total eviction
 	// cost. Upcoming is ignored.
 	ReclaimMinimal = "minimal"
 	// ReclaimQueue charges eviction cost only for models referenced by the
-	// pending queue and additionally reclaims running models the queue does
-	// not reference (the chosen set still permits them — subset semantics).
-	// With an empty queue it behaves as ReclaimMinimal.
+	// pending queue, steering the single (minimal) eviction toward idle
+	// unqueued models and away from models the queue still needs. It does
+	// not widen the evict list. With an empty queue it behaves as
+	// ReclaimMinimal.
 	ReclaimQueue = "queue"
 )
 
@@ -281,13 +285,15 @@ func topologicalOrder(definitions []Definition, deps map[string][]string) ([]str
 // candidate in set-definition order, lru prefers the candidate that evicts
 // the longest-idle running model.
 //
-// The evict list is then derived from the winning set. Under ReclaimQueue it
-// is extended beyond "running minus the set": every running model the set
-// permits (subset semantics) but the queue does not reference is reclaimed as
-// well, so a backlog drains into parallel loads instead of one eviction per
-// request. Eviction cost still protects queued models; an unqueued model with
-// a high evict_cost is reclaimed while the queue references no request for
-// it and is reloaded if a fresh request arrives.
+// The evict list is the models the winning set drops — never more. Every
+// candidate set is maximal (budget-sized), so the list is exactly the number
+// of slots the target's load refills: the fleet stays full and each queued
+// connection meets one idle model. The queue (ReclaimQueue) shapes only the
+// choice, steering the eviction toward idle unqueued models and protecting
+// models the queue still references; it does not widen the list. Because
+// different queued targets evict different idle models, the scheduler's
+// non-intersection check lets their swaps run in parallel, draining the
+// backlog one-for-one.
 func (p *Program) Solve(target string, running []string, opts SolveOptions) Decision {
 	if contains(running, target) {
 		setName, dsl := p.findContaining(running)
@@ -363,16 +369,16 @@ func (p *Program) Solve(target string, running []string, opts SolveOptions) Deci
 		}
 	}
 
+	// The evict list is the set complement only: the models the winning set
+	// drops. Because every candidate set is maximal (budget-sized), this is
+	// exactly the number of slots the target's load refills, so the fleet
+	// stays full and no slot is left idle. Under ReclaimQueue the queue does
+	// not widen this list; it only steers which idle models turn over (the
+	// charged cost below keeps queued models out of it) so the queue keeps
+	// draining one-for-one instead of the fleet collapsing.
 	var evict []string
 	for _, model := range running {
-		switch {
-		case !bestState.mask.has(evaluator.modelBits[model]):
-			// The set drops this model.
-			evict = append(evict, model)
-		case queueReclaim && !queued[model]:
-			// The set permits this model (subset semantics) but the pending
-			// queue does not reference it: reclaim the slot so queued work
-			// can load in parallel.
+		if !bestState.mask.has(evaluator.modelBits[model]) {
 			evict = append(evict, model)
 		}
 	}

@@ -30,7 +30,7 @@ func newTestMatrix(t *testing.T, conf config.Config, sets config.OrderedSets, ev
 
 	logger := logmon.NewWriter(io.Discard)
 	swapper := &matrixSwapper{
-		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical),
+		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical, config.ReclaimMinimal),
 		logger: logger,
 	}
 	base, err := newBaseRouter("matrix", conf, processes, logger, swapper)
@@ -231,7 +231,7 @@ func TestMatrixSolver_TieBreakDefinitionOrder(t *testing.T) {
 
 	// No models running, request "a": both sets have cost 0 and contain a.
 	// Definition order: "first" wins.
-	result := s.Solve("a", nil, nil)
+	result := s.Solve("a", nil, nil, nil)
 	if result.SetName != "first" {
 		t.Errorf("SetName=%q want %q", result.SetName, "first")
 	}
@@ -247,7 +247,7 @@ func TestMatrixSolver_EvictCostsPreferred(t *testing.T) {
 		{Name: "a_with_b", DSL: "a & b"}, // would evict c (cost 1)
 	}, map[string]int{"b": 10, "c": 1}, "a", "b", "c")
 
-	result := s.Solve("a", []string{"b", "c"}, nil)
+	result := s.Solve("a", []string{"b", "c"}, nil, nil)
 	if result.SetName != "a_with_b" {
 		t.Errorf("SetName=%q want %q (keep expensive b)", result.SetName, "a_with_b")
 	}
@@ -269,7 +269,7 @@ func newTestMatrixSolver(t *testing.T, sets config.OrderedSets, evictCosts map[s
 	if err := config.ValidateMatrix(matrix, models); err != nil {
 		t.Fatalf("ValidateMatrix: %v", err)
 	}
-	return newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical)
+	return newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical, config.ReclaimMinimal)
 }
 
 // TestMatrixSwapper_LRUFollowsIdleAges verifies that the swapper feeds
@@ -289,11 +289,11 @@ func TestMatrixSwapper_LRUFollowsIdleAges(t *testing.T) {
 	}
 	idles := map[string]time.Duration{"a": 10 * time.Minute, "b": time.Hour, "c": time.Minute}
 	sw := &matrixSwapper{
-		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLRU),
+		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLRU, config.ReclaimMinimal),
 		idleOf: func(id string) time.Duration { return idles[id] },
 	}
 
-	if evict := sw.EvictionFor("t", []string{"a", "b", "c"}); len(evict) != 1 || evict[0] != "b" {
+	if evict := sw.EvictionFor("t", []string{"a", "b", "c"}, nil); len(evict) != 1 || evict[0] != "b" {
 		t.Fatalf("Evict=%v want [b] (longest idle)", evict)
 	}
 	if sw.lastValid {
@@ -302,7 +302,7 @@ func TestMatrixSwapper_LRUFollowsIdleAges(t *testing.T) {
 
 	// a becomes idlest; the next decision must follow (no stale cache).
 	idles["a"] = 2 * time.Hour
-	if evict := sw.EvictionFor("t", []string{"a", "b", "c"}); len(evict) != 1 || evict[0] != "a" {
+	if evict := sw.EvictionFor("t", []string{"a", "b", "c"}, nil); len(evict) != 1 || evict[0] != "a" {
 		t.Fatalf("Evict=%v want [a] after idle ages changed", evict)
 	}
 }
@@ -318,13 +318,66 @@ func TestMatrixSwapper_LexicalCachesDecision(t *testing.T) {
 		t.Fatalf("ValidateMatrix: %v", err)
 	}
 	sw := &matrixSwapper{
-		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical),
+		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical, config.ReclaimMinimal),
 	}
-	sw.EvictionFor("a", []string{"b"})
+	sw.EvictionFor("a", []string{"b"}, nil)
 	if !sw.lastValid {
 		t.Fatal("lexical decisions should be cached")
 	}
-	if evict := sw.EvictionFor("a", []string{"b"}); evict != nil {
+	if evict := sw.EvictionFor("a", []string{"b"}, nil); evict != nil {
 		t.Fatalf("Evict=%v want none (a and b may run together)", evict)
+	}
+}
+
+// TestMatrixSwapper_ReclaimQueueFollowsTheQueue verifies that queue reclaim
+// reclaims every running model the queue does not reference, that the
+// decision is not cached while the queue is non-empty, and that an empty
+// queue falls back to the cacheable minimal behaviour.
+func TestMatrixSwapper_ReclaimQueueFollowsTheQueue(t *testing.T) {
+	models := map[string]config.ModelConfig{"t": {}, "a": {}, "b": {}, "c": {}, "d": {}}
+	matrix := &config.MatrixConfig{
+		Reclaim: config.ReclaimQueue,
+		Sets: config.OrderedSets{
+			{Name: "pool", DSL: "(t | a | b | c | d)"},
+			{Name: "all", DSL: "+pool & +pool"},
+		},
+	}
+	if err := config.ValidateMatrix(matrix, models); err != nil {
+		t.Fatalf("ValidateMatrix: %v", err)
+	}
+	sw := &matrixSwapper{
+		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical, config.ReclaimQueue),
+	}
+
+	// Budget 2: with a, b, c running and d queued, the set keeps the queued
+	// model; everything unqueued is reclaimed.
+	evict := sw.EvictionFor("t", []string{"a", "b", "c"}, []string{"d"})
+	if len(evict) != 3 {
+		t.Fatalf("Evict=%v want all three unqueued running models reclaimed", evict)
+	}
+	if sw.lastValid {
+		t.Fatal("queue-reclaim decisions with a non-empty queue must not be cached")
+	}
+
+	// The queue changes: now a is queued, so a is protected and the other
+	// two are reclaimed. The next decision must follow (no stale cache).
+	evict = sw.EvictionFor("t", []string{"a", "b", "c"}, []string{"a"})
+	if len(evict) != 2 {
+		t.Fatalf("Evict=%v want the two unqueued running models reclaimed", evict)
+	}
+	for _, m := range evict {
+		if m == "a" {
+			t.Fatalf("Evict=%v must not reclaim queued model a", evict)
+		}
+	}
+
+	// Empty queue: minimal behaviour (the budget-2 set drops two of the
+	// three running models, with no reclaim extension) and the cache engages.
+	evict = sw.EvictionFor("t", []string{"a", "b", "c"}, nil)
+	if len(evict) != 2 {
+		t.Fatalf("Evict=%v want exactly two evictions (empty queue is minimal)", evict)
+	}
+	if !sw.lastValid {
+		t.Fatal("queue-reclaim decisions with an empty queue should be cached")
 	}
 }

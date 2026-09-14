@@ -378,3 +378,29 @@ func TestValidateMatrix_EvictionTieBreaker(t *testing.T) {
 	require.NoError(t, ValidateMatrix(m, models))
 	assert.Equal(t, EvictionTieBreakerLRU, m.EvictionTieBreaker)
 }
+
+func TestValidateMatrix_Reclaim(t *testing.T) {
+	models := map[string]ModelConfig{"gemma": {}}
+	newMatrix := func(reclaim string) *MatrixConfig {
+		return &MatrixConfig{
+			Var:     map[string]string{"g": "gemma"},
+			Sets:    OrderedSets{{Name: "solo", DSL: "g"}},
+			Reclaim: reclaim,
+		}
+	}
+
+	// An unknown objective is rejected.
+	err := ValidateMatrix(newMatrix("aggressive"), models)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reclaim")
+
+	// The empty string normalizes to the historical minimal objective.
+	m := newMatrix("")
+	require.NoError(t, ValidateMatrix(m, models))
+	assert.Equal(t, ReclaimMinimal, m.Reclaim)
+
+	// queue is accepted as-is.
+	m = newMatrix(ReclaimQueue)
+	require.NoError(t, ValidateMatrix(m, models))
+	assert.Equal(t, ReclaimQueue, m.Reclaim)
+}

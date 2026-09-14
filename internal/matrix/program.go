@@ -25,6 +25,23 @@ const (
 	TieBreakerLRU = "lru"
 )
 
+// Reclaim policies for the eviction objective. ReclaimMinimal (the default)
+// minimises the total eviction cost of the running models dropped by the
+// chosen set. ReclaimQueue, used while the scheduler has a pending queue of
+// requests, charges eviction cost only for models the queue references and
+// reclaims every running model the queue does not need, so the fleet
+// converges on the work that is coming.
+const (
+	// ReclaimMinimal is the historical objective: minimise total eviction
+	// cost. Upcoming is ignored.
+	ReclaimMinimal = "minimal"
+	// ReclaimQueue charges eviction cost only for models referenced by the
+	// pending queue and additionally reclaims running models the queue does
+	// not reference (the chosen set still permits them — subset semantics).
+	// With an empty queue it behaves as ReclaimMinimal.
+	ReclaimQueue = "queue"
+)
+
 // SolveOptions configures one Solve call.
 type SolveOptions struct {
 	// EvictCosts is the relative cost of evicting a running model; models
@@ -38,6 +55,14 @@ type SolveOptions struct {
 	// request. It is consulted only when TieBreaker is TieBreakerLRU; a
 	// model absent from the map is treated as idle for zero.
 	Idle map[string]time.Duration
+	// Reclaim selects the eviction objective (ReclaimMinimal or
+	// ReclaimQueue; the empty string behaves as minimal).
+	Reclaim string
+	// Upcoming is the pending request queue as an ordered, de-duplicated
+	// list of model IDs. It is consulted only when Reclaim is
+	// ReclaimQueue; with an empty list ReclaimQueue behaves as
+	// ReclaimMinimal.
+	Upcoming []string
 }
 
 // Resolver maps a DSL identifier to a real model name.
@@ -249,10 +274,20 @@ func topologicalOrder(definitions []Definition, deps map[string][]string) ([]str
 // a fresh projection because the relevant model universe changes with the
 // running set supplied by the scheduler.
 //
-// Equal-cost candidates are ordered by opts.TieBreaker: lexical (the default)
-// keeps the first in set-definition order; lru prefers the candidate that
-// evicts the longest-idle running model. A candidate evicting nothing ranks
-// zero, so zero-cost ties keep the lexical winner.
+// Candidate sets are ordered, best first: (1) when ReclaimQueue is active, the
+// cost of evicting models the pending queue references — evicting only
+// unqueued models scores zero; (2) the raw eviction cost (the historical
+// objective); (3) the tie-breaker: lexical (the default) keeps the first
+// candidate in set-definition order, lru prefers the candidate that evicts
+// the longest-idle running model.
+//
+// The evict list is then derived from the winning set. Under ReclaimQueue it
+// is extended beyond "running minus the set": every running model the set
+// permits (subset semantics) but the queue does not reference is reclaimed as
+// well, so a backlog drains into parallel loads instead of one eviction per
+// request. Eviction cost still protects queued models; an unqueued model with
+// a high evict_cost is reclaimed while the queue references no request for
+// it and is reloaded if a fresh request arrives.
 func (p *Program) Solve(target string, running []string, opts SolveOptions) Decision {
 	if contains(running, target) {
 		setName, dsl := p.findContaining(running)
@@ -273,8 +308,19 @@ func (p *Program) Solve(target string, running []string, opts SolveOptions) Deci
 	globalTargetBit, targetKnown := p.modelBits[target]
 
 	lru := opts.TieBreaker == TieBreakerLRU
-	bestCost := -1
-	bestIdleRank := time.Duration(0)
+	// Queue reclaim is active only with a non-empty queue; with an empty
+	// queue the objective (and the evict list) fall back to minimal.
+	queueReclaim := opts.Reclaim == ReclaimQueue && len(opts.Upcoming) > 0
+	var queued map[string]bool
+	if queueReclaim {
+		queued = make(map[string]bool, len(opts.Upcoming))
+		for _, model := range opts.Upcoming {
+			queued[model] = true
+		}
+	}
+
+	best := solveRank{}
+	bestValid := false
 	var bestSet *compiledSet
 	var bestState projectedState
 	for i := range p.sets {
@@ -287,32 +333,23 @@ func (p *Program) Solve(target string, running []string, opts SolveOptions) Deci
 				continue
 			}
 
-			cost := 0
+			rank := solveRank{}
 			var evicted []string
 			for _, model := range running {
 				if !state.mask.has(evaluator.modelBits[model]) {
-					cost += evictionCost(opts.EvictCosts, model)
+					c := evictionCost(opts.EvictCosts, model)
+					rank.cost += c
+					if queueReclaim && queued[model] {
+						rank.charged += c
+					}
 					evicted = append(evicted, model)
 				}
 			}
+			rank.idle = idleRank(evicted, opts.Idle)
 
-			better := false
-			switch {
-			case bestCost < 0:
-				better = true
-			case cost < bestCost:
-				better = true
-			case lru:
-				// cost == bestCost here: prefer evicting the longer-idle
-				// model. A strict comparison keeps the first candidate on a
-				// residual tie, so outcomes stay deterministic.
-				if rank := idleRank(evicted, opts.Idle); rank > bestIdleRank {
-					better = true
-				}
-			}
-			if better {
-				bestCost = cost
-				bestIdleRank = idleRank(evicted, opts.Idle)
+			if !bestValid || rank.less(best, queueReclaim, lru) {
+				best = rank
+				bestValid = true
 				bestSet = set
 				bestState = state
 			}
@@ -328,17 +365,57 @@ func (p *Program) Solve(target string, running []string, opts SolveOptions) Deci
 
 	var evict []string
 	for _, model := range running {
-		if !bestState.mask.has(evaluator.modelBits[model]) {
+		switch {
+		case !bestState.mask.has(evaluator.modelBits[model]):
+			// The set drops this model.
+			evict = append(evict, model)
+		case queueReclaim && !queued[model]:
+			// The set permits this model (subset semantics) but the pending
+			// queue does not reference it: reclaim the slot so queued work
+			// can load in parallel.
 			evict = append(evict, model)
 		}
+	}
+
+	totalCost := 0
+	for _, model := range evict {
+		totalCost += evictionCost(opts.EvictCosts, model)
 	}
 	return Decision{
 		Evict:     evict,
 		TargetSet: flattenWitness(bestState.witness),
 		SetName:   bestSet.name,
 		DSL:       bestSet.dsl,
-		TotalCost: bestCost,
+		TotalCost: totalCost,
 	}
+}
+
+// solveRank scores one candidate set. Lower is better; the ordering depends
+// on the reclaim and tie-breaker policies (see Solve).
+type solveRank struct {
+	// charged is the eviction cost of queued models (queue reclaim only).
+	charged int
+	// cost is the raw eviction cost of every model the set drops.
+	cost int
+	// idle is the longest idle time among the models the set drops (lru
+	// tie-breaker only). Higher is better.
+	idle time.Duration
+}
+
+// less reports whether r orders before o. A false result on an exact tie
+// keeps the first candidate in set-definition order, so outcomes stay
+// deterministic.
+func (r solveRank) less(o solveRank, queueReclaim, lru bool) bool {
+	if queueReclaim && r.charged != o.charged {
+		return r.charged < o.charged
+	}
+	if r.cost != o.cost {
+		return r.cost < o.cost
+	}
+	if lru && r.idle != o.idle {
+		return r.idle > o.idle
+	}
+	return false
 }
 
 // CanContainAll reports whether one generated set contains every supplied model.

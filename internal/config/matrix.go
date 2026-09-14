@@ -21,6 +21,18 @@ const (
 	EvictionTieBreakerLRU = "lru"
 )
 
+// Reclaim selects the matrix solver's eviction objective.
+const (
+	// ReclaimMinimal minimises total eviction cost (the historical
+	// objective); models not in the pending queue are still costed.
+	ReclaimMinimal = "minimal"
+	// ReclaimQueue charges eviction cost only for models the pending
+	// request queue references and prefers sets that keep queued models
+	// warm, so the fleet converges on the work that is coming while a
+	// backlog exists.
+	ReclaimQueue = "queue"
+)
+
 // MatrixConfig represents the swap matrix configuration block.
 type MatrixConfig struct {
 	Var        map[string]string `yaml:"vars"`
@@ -29,6 +41,9 @@ type MatrixConfig struct {
 	// EvictionTieBreaker is normalized to a non-empty value by
 	// ValidateMatrix; empty means EvictionTieBreakerLexical.
 	EvictionTieBreaker string `yaml:"eviction_tiebreaker"`
+	// Reclaim is normalized to a non-empty value by ValidateMatrix; empty
+	// means ReclaimMinimal.
+	Reclaim string `yaml:"reclaim"`
 
 	program *matrixdsl.Program
 }
@@ -82,6 +97,15 @@ func ValidateMatrix(matrix *MatrixConfig, models map[string]ModelConfig) error {
 	case EvictionTieBreakerLexical, EvictionTieBreakerLRU:
 	default:
 		return fmt.Errorf("eviction_tiebreaker must be %q or %q, got %q", EvictionTieBreakerLexical, EvictionTieBreakerLRU, matrix.EvictionTieBreaker)
+	}
+
+	// Normalize the reclaim objective the same way.
+	switch matrix.Reclaim {
+	case "":
+		matrix.Reclaim = ReclaimMinimal
+	case ReclaimMinimal, ReclaimQueue:
+	default:
+		return fmt.Errorf("reclaim must be %q or %q, got %q", ReclaimMinimal, ReclaimQueue, matrix.Reclaim)
 	}
 
 	// Validate var entries

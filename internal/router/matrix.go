@@ -30,7 +30,7 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 	// map, which is populated below).
 	processes := make(map[string]process.Process, len(conf.Models))
 	swapper := &matrixSwapper{
-		solver: newMatrixSolver(mtx.Program(), mtx.ResolvedEvictCosts(), mtx.EvictionTieBreaker),
+		solver: newMatrixSolver(mtx.Program(), mtx.ResolvedEvictCosts(), mtx.EvictionTieBreaker, mtx.Reclaim),
 		logger: proxylog,
 		idleOf: func(id string) time.Duration {
 			proc, ok := processes[id]
@@ -84,8 +84,10 @@ func NewMatrix(conf config.Config, proxylog, upstreamlog *logmon.Monitor) (*Matr
 // OnSwapStart with the same target and running set it just gave EvictionFor,
 // so the last decision is cached and reused instead of solving twice per
 // swap. The cache is only valid under that single-goroutine access pattern,
-// and only in lexical mode: an lru decision depends on idle ages, which move
-// between calls, so lru solves are never cached.
+// and only when the decision is a pure function of (target, running):
+// lru decisions depend on idle ages, and queue-reclaim decisions depend on
+// the pending queue, both of which move between calls, so neither is ever
+// cached.
 type matrixSwapper struct {
 	solver *matrixSolver
 	logger *logmon.Monitor
@@ -93,6 +95,12 @@ type matrixSwapper struct {
 	// request; wired to the router's process table by NewMatrix. Only used
 	// by the lru tie-breaker.
 	idleOf func(id string) time.Duration
+	// lastUpcoming carries the pending queue from EvictionFor into the
+	// immediate OnSwapStart re-solve: queue reclaim bypasses the decision
+	// cache, so OnSwapStart must re-solve against the same queue EvictionFor
+	// decided on. FIFO calls the two back-to-back on the event-loop
+	// goroutine, so the last value is the right one.
+	lastUpcoming []string
 
 	lastTarget  string
 	lastRunning []string
@@ -100,13 +108,24 @@ type matrixSwapper struct {
 	lastValid   bool
 }
 
-func (p *matrixSwapper) solve(target string, running []string) solveResult {
-	lru := p.solver.tieBreaker == config.EvictionTieBreakerLRU
-	if !lru && p.lastValid && p.lastTarget == target && slices.Equal(p.lastRunning, running) {
+// cacheable reports whether the decision is a pure function of (target,
+// running) and may be cached between EvictionFor and OnSwapStart. An lru
+// decision depends on idle ages; a queue-reclaim decision depends on the
+// pending queue (lastUpcoming, which the cache key does not cover). Queue
+// reclaim with an empty queue behaves as minimal and is cacheable again.
+func (p *matrixSwapper) cacheable() bool {
+	if p.solver.tieBreaker != config.EvictionTieBreakerLexical {
+		return false
+	}
+	return p.solver.reclaim == config.ReclaimMinimal || len(p.lastUpcoming) == 0
+}
+
+func (p *matrixSwapper) solve(target string, running, upcoming []string) solveResult {
+	if p.cacheable() && p.lastValid && p.lastTarget == target && slices.Equal(p.lastRunning, running) {
 		return p.lastResult
 	}
-	result := p.solver.Solve(target, running, p.idleSnapshot(running))
-	if !lru {
+	result := p.solver.Solve(target, running, p.idleSnapshot(running), upcoming)
+	if p.cacheable() {
 		p.lastTarget = target
 		p.lastRunning = slices.Clone(running)
 		p.lastResult = result
@@ -128,12 +147,13 @@ func (p *matrixSwapper) idleSnapshot(running []string) map[string]time.Duration 
 	return idle
 }
 
-func (p *matrixSwapper) EvictionFor(target string, running []string) []string {
-	return p.solve(target, running).Evict
+func (p *matrixSwapper) EvictionFor(target string, running, upcoming []string) []string {
+	p.lastUpcoming = upcoming
+	return p.solve(target, running, upcoming).Evict
 }
 
 func (p *matrixSwapper) OnSwapStart(target string, running []string) {
-	result := p.solve(target, running)
+	result := p.solve(target, running, p.lastUpcoming)
 	switch {
 	case len(result.Evict) > 0:
 		p.logger.Infof("matrix: model=%s set=%s dsl=%q evict=%v target=%v cost=%d",

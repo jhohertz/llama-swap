@@ -3,8 +3,8 @@ title: Running several models at once with groups and matrix
 summary: Choosing between the group and matrix routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, concurrency, swap, vram]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix]
-updated: 2026-08-25
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.matrix.eviction_tiebreaker]
+updated: 2026-08-28
 ---
 
 # Running several models at once: groups and matrix
@@ -107,7 +107,8 @@ How the solver works when a request for model X arrives:
 1. If X is already running, forward the request.
 2. Otherwise collect every set containing X.
 3. For each set, sum the `evict_costs` of running models *not* in that set.
-4. Pick the lowest-cost set, ties broken by definition order.
+4. Pick the lowest-cost set; equal-cost sets are ordered by
+   `eviction_tiebreaker` (definition order by default).
 5. Evict the models outside it, start X, forward the request.
 
 Two things worth internalising:
@@ -118,6 +119,34 @@ Two things worth internalising:
 
 `evict_costs` (default 1) is how you express "this one is painful to reload".
 Give slow cold-starting backends a high cost.
+
+### Choosing which model to evict (`eviction_tiebreaker`)
+
+`evict_costs` orders candidates by how much eviction would hurt. When two
+candidates score **exactly the same cost**, the solver still has to pick one.
+`settings.matrix.eviction_tiebreaker` chooses how:
+
+```yaml
+settings:
+  matrix:
+    eviction_tiebreaker: lru   # default: lexical
+```
+
+- **`lexical`** (default): the first equal-cost candidate in set-definition
+  order wins. Deterministic and the historical behaviour; if you never set
+  the key, nothing changes.
+- **`lru`**: the candidate that evicts the **longest-idle** model wins
+  (idle = time since the model became ready or last finished a request). A
+  cost tie between evicting a model idle for an hour and one idle for a
+  minute evicts the hour-old one.
+
+Cost is always the primary key: lru never evicts a high-cost model in favour
+of a cheaper idle one — it only orders candidates that cost the same. When
+idle times are also equal, the decision falls back to definition order, so
+outcomes stay deterministic either way.
+
+The group router has no equal-cost choices to make (it evicts its whole
+swap set), so this setting only applies to matrix.
 
 ## Which one?
 

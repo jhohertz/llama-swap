@@ -329,11 +329,13 @@ func TestMatrixSwapper_LexicalCachesDecision(t *testing.T) {
 	}
 }
 
-// TestMatrixSwapper_ReclaimQueueFollowsTheQueue verifies that queue reclaim
-// reclaims every running model the queue does not reference, that the
-// decision is not cached while the queue is non-empty, and that an empty
-// queue falls back to the cacheable minimal behaviour.
-func TestMatrixSwapper_ReclaimQueueFollowsTheQueue(t *testing.T) {
+// TestMatrixSwapper_ReclaimQueueProtectsQueued verifies that queue reclaim
+// keeps the evict list at the minimal count (the budget-2 set drops two of
+// the three running models) while steering the choice away from a model the
+// queue still references; that the decision is not cached while the queue is
+// non-empty; and that an empty queue falls back to the cacheable minimal
+// behaviour.
+func TestMatrixSwapper_ReclaimQueueProtectsQueued(t *testing.T) {
 	models := map[string]config.ModelConfig{"t": {}, "a": {}, "b": {}, "c": {}, "d": {}}
 	matrix := &config.MatrixConfig{
 		Reclaim: config.ReclaimQueue,
@@ -349,30 +351,32 @@ func TestMatrixSwapper_ReclaimQueueFollowsTheQueue(t *testing.T) {
 		solver: newMatrixSolver(matrix.Program(), matrix.ResolvedEvictCosts(), config.EvictionTieBreakerLexical, config.ReclaimQueue),
 	}
 
-	// Budget 2: with a, b, c running and d queued, the set keeps the queued
-	// model; everything unqueued is reclaimed.
+	// Budget 2: with a, b, c running and d queued (not running), the minimal
+	// set keeps the target plus one of a, b, c and evicts two. The queue does
+	// not widen the list.
 	evict := sw.EvictionFor("t", []string{"a", "b", "c"}, []string{"d"})
-	if len(evict) != 3 {
-		t.Fatalf("Evict=%v want all three unqueued running models reclaimed", evict)
+	if len(evict) != 2 {
+		t.Fatalf("Evict=%v want exactly two evictions (minimal count, no extension)", evict)
 	}
 	if sw.lastValid {
 		t.Fatal("queue-reclaim decisions with a non-empty queue must not be cached")
 	}
 
-	// The queue changes: now a is queued, so a is protected and the other
-	// two are reclaimed. The next decision must follow (no stale cache).
+	// The queue changes: now a is queued and running, so a is protected and
+	// the two idle unqueued models turn over. The next decision must follow
+	// (no stale cache).
 	evict = sw.EvictionFor("t", []string{"a", "b", "c"}, []string{"a"})
 	if len(evict) != 2 {
-		t.Fatalf("Evict=%v want the two unqueued running models reclaimed", evict)
+		t.Fatalf("Evict=%v want two evictions", evict)
 	}
 	for _, m := range evict {
 		if m == "a" {
-			t.Fatalf("Evict=%v must not reclaim queued model a", evict)
+			t.Fatalf("Evict=%v must not evict queued model a", evict)
 		}
 	}
 
-	// Empty queue: minimal behaviour (the budget-2 set drops two of the
-	// three running models, with no reclaim extension) and the cache engages.
+	// Empty queue: minimal behaviour (the budget-2 set drops two of the three
+	// running models) and the cache engages.
 	evict = sw.EvictionFor("t", []string{"a", "b", "c"}, nil)
 	if len(evict) != 2 {
 		t.Fatalf("Evict=%v want exactly two evictions (empty queue is minimal)", evict)

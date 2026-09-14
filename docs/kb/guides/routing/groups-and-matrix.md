@@ -154,17 +154,16 @@ outcomes stay deterministic either way.
 The group router has no equal-cost choices to make (it evicts its whole
 swap set), so this setting only applies to matrix.
 
-### Reclaiming slots while a queue is pending (`reclaim`)
+### Steering evictions while a queue is pending (`reclaim`)
 
-Both policies above answer "which model goes?". `reclaim` answers a
-different question: **how much goes?**
+The tie-breaker orders candidates once the eviction count is fixed;
+`reclaim` adds a preference that only applies while requests are queued:
+**turn over idle models, protect models the queue still needs.**
 
-By default the solver evicts the minimum the budget forces — with a
-full budget, exactly one model per new request. If a backlog of requests
-is queued behind that swap, the other running models usually sit loaded
-and idle the whole time: each queued request gets served one serial
-swap at a time, and slots that queued work will never use stay occupied
-until TTL unloads them.
+The eviction *count* is always the minimum the budget forces — the solver's
+set is always budget-sized, so the fleet stays full and every eviction is
+met by exactly one queued connection taking the freed slot. What the queue
+changes is *which* idle model turns over:
 
 ```yaml
 settings:
@@ -175,25 +174,33 @@ settings:
 - **`minimal`** (default): minimise total eviction cost — the historical
   behaviour.
 - **`queue`**: while the pending request queue is **non-empty**, eviction
-  cost is charged only for models the queue references, and every running
-  model the queue does not reference is reclaimed. The fleet converges on
-  the work that is coming: a burst of requests drains into parallel loads
-  instead of one eviction per request. With an empty queue the objective
-  falls back to minimal, so interactive traffic is unaffected.
+  cost is charged only for models the queue references. Idle models the
+  queue does not reference turn over first — even at a high
+  `evict_cost` — while a model the queue still references is protected.
+  With an empty queue the objective falls back to minimal, so interactive
+  traffic is unaffected.
+
+Because each queued target evicts a single idle model, different targets
+evict *different* models, and the scheduler runs their swaps in parallel
+(its collision check only blocks intersecting evict sets). A burst of
+requests therefore drains one-for-one — no serial swap per request, and no
+emptied fleet while the backlog works through.
 
 What `queue` does **not** do:
 
-- evict a model that the queue references (its `evict_cost` is the
-  protection; only budget pressure that the queue cannot avoid forces it
-  out, at the least painful cost);
+- evict a model the queue references (its `evict_cost` is the protection;
+  only budget pressure the queue cannot avoid forces it out, at the least
+  painful cost);
+- evict more than the request needs — the fleet stays full; an eviction is
+  only made when a queued connection takes the slot;
 - evict a model mid-request (the scheduler waits for in-flight requests
   to drain, as always);
 - reach into the group router (same as `eviction_tiebreaker`).
 
-The trade: an unqueued model with a high `evict_cost` **is** reclaimed
-while the queue references nothing for it, and a fresh request for it
-pays the reload. That is the point of the knob — during a backlog, the
-queue is the best available prediction of what comes next.
+The trade: an unqueued model with a high `evict_cost` **is** turned over
+while the queue references nothing for it, and a fresh request for it pays
+the reload. That is the point of the knob — during a backlog, the queue is
+the best available prediction of what comes next.
 
 ## Which one?
 

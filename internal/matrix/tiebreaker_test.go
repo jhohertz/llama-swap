@@ -13,7 +13,7 @@ func newTieBreakerProgram(t *testing.T) *Program {
 	t.Helper()
 	p, err := Compile([]Definition{
 		{Name: "pool", DSL: "(t | a | b | c)"},
-		{Name: "all",  DSL: "+pool & +pool & +pool"},
+		{Name: "all", DSL: "+pool & +pool & +pool"},
 	}, func(ident string) (string, bool) { return ident, true })
 	if err != nil {
 		t.Fatalf("Compile: %v", err)

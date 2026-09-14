@@ -3,7 +3,7 @@ title: Running several models at once with groups and matrix
 summary: Choosing between the group and matrix routers, and how each decides what gets unloaded.
 category: guides
 tags: [routing, groups, matrix, concurrency, swap, vram]
-config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.matrix.eviction_tiebreaker]
+config_keys: [routing, routing.router.use, routing.router.settings.groups, routing.router.settings.matrix, routing.router.settings.matrix.eviction_tiebreaker, routing.router.settings.matrix.reclaim]
 updated: 2026-08-28
 ---
 
@@ -147,6 +147,47 @@ outcomes stay deterministic either way.
 
 The group router has no equal-cost choices to make (it evicts its whole
 swap set), so this setting only applies to matrix.
+
+### Reclaiming slots while a queue is pending (`reclaim`)
+
+Both policies above answer "which model goes?". `reclaim` answers a
+different question: **how much goes?**
+
+By default the solver evicts the minimum the budget forces — with a
+full budget, exactly one model per new request. If a backlog of requests
+is queued behind that swap, the other running models usually sit loaded
+and idle the whole time: each queued request gets served one serial
+swap at a time, and slots that queued work will never use stay occupied
+until TTL unloads them.
+
+```yaml
+settings:
+  matrix:
+    reclaim: queue   # default: minimal
+```
+
+- **`minimal`** (default): minimise total eviction cost — the historical
+  behaviour.
+- **`queue`**: while the pending request queue is **non-empty**, eviction
+  cost is charged only for models the queue references, and every running
+  model the queue does not reference is reclaimed. The fleet converges on
+  the work that is coming: a burst of requests drains into parallel loads
+  instead of one eviction per request. With an empty queue the objective
+  falls back to minimal, so interactive traffic is unaffected.
+
+What `queue` does **not** do:
+
+- evict a model that the queue references (its `evict_cost` is the
+  protection; only budget pressure that the queue cannot avoid forces it
+  out, at the least painful cost);
+- evict a model mid-request (the scheduler waits for in-flight requests
+  to drain, as always);
+- reach into the group router (same as `eviction_tiebreaker`).
+
+The trade: an unqueued model with a high `evict_cost` **is** reclaimed
+while the queue references nothing for it, and a fresh request for it
+pays the reload. That is the point of the knob — during a backlog, the
+queue is the best available prediction of what comes next.
 
 ## Which one?
 
